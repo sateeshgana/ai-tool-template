@@ -25,9 +25,38 @@ export default async (req: Request): Promise<Response> => {
     )
   }
 
-  const { messages } = await req.json()
+  let body: { messages?: unknown }
+  try {
+    body = await req.json()
+  } catch {
+    return new Response(
+      JSON.stringify({ error: 'Invalid JSON body' }),
+      { status: 400, headers: { ...CORS, 'Content-Type': 'application/json' } }
+    )
+  }
 
-  const isGroq    = !!process.env.GROQ_API_KEY
+  if (!Array.isArray(body.messages)) {
+    return new Response(
+      JSON.stringify({ error: 'messages must be an array' }),
+      { status: 400, headers: { ...CORS, 'Content-Type': 'application/json' } }
+    )
+  }
+
+  // Strip any system messages from client — system prompt is server-side only
+  const userMessages = body.messages.filter(
+    (m): m is { role: string; content: string } =>
+      typeof m === 'object' && m !== null &&
+      'role' in m && 'content' in m &&
+      (m as { role: string }).role !== 'system'
+  )
+
+  // Prepend system prompt from env if set
+  const systemPrompt = process.env.SYSTEM_PROMPT
+  const messages = systemPrompt
+    ? [{ role: 'system', content: systemPrompt }, ...userMessages]
+    : userMessages
+
+  const isGroq     = !!process.env.GROQ_API_KEY
   const isDeepSeek = !!process.env.DEEPSEEK_API_KEY
 
   const baseUrl = isGroq
@@ -42,24 +71,45 @@ export default async (req: Request): Promise<Response> => {
     ? 'deepseek-chat'
     : 'gpt-4o-mini'
 
-  const upstream = await fetch(`${baseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ model, messages, stream: false }),
-  })
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 20_000)
+
+  let upstream: Response
+  try {
+    upstream = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model, messages, stream: false }),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    clearTimeout(timeout)
+    const message = err instanceof Error && err.name === 'AbortError'
+      ? 'Request timed out'
+      : 'Failed to reach AI provider'
+    return new Response(
+      JSON.stringify({ error: message }),
+      { status: 502, headers: { ...CORS, 'Content-Type': 'application/json' } }
+    )
+  }
+  clearTimeout(timeout)
 
   if (!upstream.ok) {
-    const err = await upstream.text()
+    let message = `AI provider error (${upstream.status})`
+    try {
+      const errData = await upstream.json() as { error?: { message?: string } }
+      if (errData.error?.message) message = errData.error.message
+    } catch { /* ignore parse errors */ }
     return new Response(
-      JSON.stringify({ error: err }),
+      JSON.stringify({ error: message }),
       { status: upstream.status, headers: { ...CORS, 'Content-Type': 'application/json' } }
     )
   }
 
-  const data = await upstream.json()
+  const data = await upstream.json() as { choices?: Array<{ message?: { content?: string } }> }
   const content = data.choices?.[0]?.message?.content ?? ''
 
   return new Response(

@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { config } from './config'
-import type { InputField } from './types'
+import type { AppConfig, InputField } from './types'
 
-const ACCENT: Record<string, string> = {
+const ACCENT: Record<AppConfig['accentColor'], string> = {
   cyan:    'bg-cyan-500 hover:bg-cyan-400',
   emerald: 'bg-emerald-500 hover:bg-emerald-400',
   violet:  'bg-violet-500 hover:bg-violet-400',
@@ -11,7 +11,7 @@ const ACCENT: Record<string, string> = {
   blue:    'bg-blue-500 hover:bg-blue-400',
 }
 
-const ACCENT_TEXT: Record<string, string> = {
+const ACCENT_TEXT: Record<AppConfig['accentColor'], string> = {
   cyan:    'text-cyan-400',
   emerald: 'text-emerald-400',
   violet:  'text-violet-400',
@@ -22,7 +22,8 @@ const ACCENT_TEXT: Record<string, string> = {
 
 function buildUserMessage(fields: InputField[], values: Record<string, string>): string {
   return fields
-    .map(f => `${f.label}:\n${values[f.id] ?? ''}`)
+    .filter(f => (values[f.id] ?? '').trim().length > 0)
+    .map(f => `${f.label}:\n${values[f.id]}`)
     .join('\n\n')
 }
 
@@ -32,8 +33,10 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError]     = useState('')
 
-  const accent     = ACCENT[config.accentColor]     ?? ACCENT.cyan
-  const accentText = ACCENT_TEXT[config.accentColor] ?? ACCENT_TEXT.cyan
+  const accent     = ACCENT[config.accentColor]
+  const accentText = ACCENT_TEXT[config.accentColor]
+
+  const hasInput = config.inputs.some(f => (values[f.id] ?? '').trim().length > 0)
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -47,8 +50,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: [
-            { role: 'system', content: config.systemPrompt },
-            { role: 'user',   content: buildUserMessage(config.inputs, values) },
+            { role: 'user', content: buildUserMessage(config.inputs, values) },
           ],
         }),
       })
@@ -109,7 +111,7 @@ export default function App() {
                   className="w-full bg-gray-900 border border-gray-700 rounded-lg px-4 py-3 text-sm text-gray-100 focus:outline-none focus:ring-2 focus:ring-offset-0"
                 >
                   <option value="">Select…</option>
-                  {field.options?.map(opt => (
+                  {field.options.map(opt => (
                     <option key={opt} value={opt}>{opt}</option>
                   ))}
                 </select>
@@ -119,7 +121,7 @@ export default function App() {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || !hasInput}
             className={`w-full ${accent} disabled:opacity-50 text-white font-semibold py-3 rounded-lg text-sm transition-colors`}
           >
             {loading ? 'Generating…' : 'Generate'}

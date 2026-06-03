@@ -1,10 +1,12 @@
-export interface InputField {
+interface BaseField {
   id: string
   label: string
-  type: 'text' | 'textarea' | 'select'
   placeholder?: string
-  options?: string[]
 }
+
+export type InputField =
+  | (BaseField & { type: 'text' | 'textarea' })
+  | (BaseField & { type: 'select'; options: string[] })
 
 export interface AppConfig {
   name: string
