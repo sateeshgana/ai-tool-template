@@ -4,6 +4,44 @@ const CORS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
+type Provider = {
+  baseUrl: string
+  apiKey: string
+  model: string
+}
+
+function detectProvider(): Provider | null {
+  if (process.env.GROQ_API_KEY) {
+    return {
+      baseUrl: 'https://api.groq.com/openai/v1',
+      apiKey:  process.env.GROQ_API_KEY,
+      model:   'llama-3.3-70b-versatile',
+    }
+  }
+  if (process.env.DEEPSEEK_API_KEY) {
+    return {
+      baseUrl: 'https://api.deepseek.com/v1',
+      apiKey:  process.env.DEEPSEEK_API_KEY,
+      model:   'deepseek-chat',
+    }
+  }
+  if (process.env.OPENAI_API_KEY) {
+    return {
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey:  process.env.OPENAI_API_KEY,
+      model:   'gpt-4o-mini',
+    }
+  }
+  if (process.env.OPENROUTER_API_KEY) {
+    return {
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey:  process.env.OPENROUTER_API_KEY,
+      model:   'meta-llama/llama-3.3-70b-instruct:free',
+    }
+  }
+  return null
+}
+
 export default async (req: Request): Promise<Response> => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS })
@@ -13,12 +51,8 @@ export default async (req: Request): Promise<Response> => {
     return new Response('Method not allowed', { status: 405, headers: CORS })
   }
 
-  const apiKey =
-    process.env.GROQ_API_KEY ||
-    process.env.DEEPSEEK_API_KEY ||
-    process.env.OPENAI_API_KEY
-
-  if (!apiKey) {
+  const provider = detectProvider()
+  if (!provider) {
     return new Response(
       JSON.stringify({ error: 'No API key configured' }),
       { status: 500, headers: { ...CORS, 'Content-Type': 'application/json' } }
@@ -42,47 +76,25 @@ export default async (req: Request): Promise<Response> => {
     )
   }
 
-  // Strip any system messages from client — system prompt is server-side only
-  const userMessages = body.messages.filter(
-    (m): m is { role: string; content: string } =>
-      typeof m === 'object' && m !== null &&
-      'role' in m && 'content' in m &&
-      (m as { role: string }).role !== 'system'
-  )
-
-  // Prepend system prompt from env if set
   const systemPrompt = process.env.SYSTEM_PROMPT
+  const userMessages = (body.messages as Array<{ role: string; content: string }>)
+    .filter(m => m.role !== 'system')
   const messages = systemPrompt
     ? [{ role: 'system', content: systemPrompt }, ...userMessages]
     : userMessages
-
-  const isGroq     = !!process.env.GROQ_API_KEY
-  const isDeepSeek = !!process.env.DEEPSEEK_API_KEY
-
-  const baseUrl = isGroq
-    ? 'https://api.groq.com/openai/v1'
-    : isDeepSeek
-    ? 'https://api.deepseek.com/v1'
-    : 'https://api.openai.com/v1'
-
-  const model = isGroq
-    ? 'llama-3.3-70b-versatile'
-    : isDeepSeek
-    ? 'deepseek-chat'
-    : 'gpt-4o-mini'
 
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 20_000)
 
   let upstream: Response
   try {
-    upstream = await fetch(`${baseUrl}/chat/completions`, {
+    upstream = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${provider.apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ model, messages, stream: false }),
+      body: JSON.stringify({ model: provider.model, messages, stream: true }),
       signal: controller.signal,
     })
   } catch (err) {
@@ -102,18 +114,61 @@ export default async (req: Request): Promise<Response> => {
     try {
       const errData = await upstream.json() as { error?: { message?: string } }
       if (errData.error?.message) message = errData.error.message
-    } catch { /* ignore parse errors */ }
+    } catch { /* ignore */ }
     return new Response(
       JSON.stringify({ error: message }),
       { status: upstream.status, headers: { ...CORS, 'Content-Type': 'application/json' } }
     )
   }
 
-  const data = await upstream.json() as { choices?: Array<{ message?: { content?: string } }> }
-  const content = data.choices?.[0]?.message?.content ?? ''
+  // Pipe the provider SSE stream to the client as SSE
+  const encoder = new TextEncoder()
+  const { readable, writable } = new TransformStream()
+  const writer = writable.getWriter()
 
-  return new Response(
-    JSON.stringify({ content }),
-    { status: 200, headers: { ...CORS, 'Content-Type': 'application/json' } }
-  )
+  ;(async () => {
+    const reader = upstream.body!.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed || trimmed === 'data: [DONE]') continue
+          if (!trimmed.startsWith('data: ')) continue
+
+          try {
+            const json = JSON.parse(trimmed.slice(6)) as {
+              choices?: Array<{ delta?: { content?: string } }>
+            }
+            const token = json.choices?.[0]?.delta?.content
+            if (token) {
+              await writer.write(encoder.encode(`data: ${token}\n\n`))
+            }
+          } catch { /* malformed chunk — skip */ }
+        }
+      }
+    } finally {
+      await writer.write(encoder.encode('data: [DONE]\n\n'))
+      await writer.close()
+    }
+  })()
+
+  return new Response(readable, {
+    status: 200,
+    headers: {
+      ...CORS,
+      'Content-Type':      'text/event-stream',
+      'Cache-Control':     'no-cache',
+      'X-Accel-Buffering': 'no',
+    },
+  })
 }
