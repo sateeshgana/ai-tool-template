@@ -79,7 +79,8 @@ export default function App() {
         throw new Error(data.error ?? `HTTP ${res.status}`)
       }
 
-      const reader  = res.body!.getReader()
+      if (!res.body) throw new Error('No response body received')
+      const reader  = res.body.getReader()
       const decoder = new TextDecoder()
       let buffer    = ''
 
