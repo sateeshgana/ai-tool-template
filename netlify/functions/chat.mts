@@ -127,7 +127,12 @@ export default async (req: Request): Promise<Response> => {
   const writer = writable.getWriter()
 
   ;(async () => {
-    const reader = upstream.body!.getReader()
+    if (!upstream.body) {
+      try { await writer.write(encoder.encode('data: [DONE]\n\n')) } catch { /* ignore */ }
+      try { await writer.close() } catch { /* ignore */ }
+      return
+    }
+    const reader = upstream.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
 
@@ -150,15 +155,16 @@ export default async (req: Request): Promise<Response> => {
               choices?: Array<{ delta?: { content?: string } }>
             }
             const token = json.choices?.[0]?.delta?.content
-            if (token) {
+            if (token != null) {
               await writer.write(encoder.encode(`data: ${token}\n\n`))
             }
           } catch { /* malformed chunk — skip */ }
         }
       }
     } finally {
-      await writer.write(encoder.encode('data: [DONE]\n\n'))
-      await writer.close()
+      reader.cancel().catch(() => {})
+      try { await writer.write(encoder.encode('data: [DONE]\n\n')) } catch { /* client gone */ }
+      try { await writer.close() } catch { /* already closed */ }
     }
   })()
 
